@@ -12,6 +12,8 @@ services:
       # before the upload is refused with 429.
       SWAP_WAIT_SECONDS: "3"
       SHUTDOWN_GRACE_SECONDS: "20"
+      # How long a completed /infer/once record serves retries (seconds).
+      ONCE_RETENTION_SECONDS: "600"
       LOG_LEVEL: INFO
       # Optional: load an existing artifact at startup.
       # BOOTSTRAP_VERSION: v1

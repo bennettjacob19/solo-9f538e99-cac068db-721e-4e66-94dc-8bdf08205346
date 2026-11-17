@@ -3,6 +3,8 @@
 Public surface (see ``/docs``):
 
 * ``POST /infer``            -- classify a feature vector with a client timeout
+* ``POST /infer/once``       -- idempotent per-workpiece classification: retries
+                                share one computation, result, version and error
 * ``POST /admin/models``     -- upload a classifier artifact and hot-swap it in
 * ``GET  /admin/versions``   -- version registry
 * ``GET  /admin/status``     -- active version, in-flight counts, process states
@@ -13,6 +15,12 @@ version runs in its own OS process, at most two such processes exist at once,
 requests are pinned to the version active at admission, and a retired version
 only releases its slot once every inference it actually accepted has finished
 inside its worker -- regardless of whether the client is still waiting.
+
+``/infer/once`` adds workpiece-level idempotency on top of that: the first
+accepted call for a ``(device_id, workpiece_id)`` key pins the active version
+and an inference id; every concurrent or later retry with the same features
+awaits/replays that one computation.  Its bookkeeping lives in
+``app/idempotency.py``.
 """
 
 from __future__ import annotations
@@ -31,8 +39,9 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.idempotency import OnceConflict, OnceRecord, OnceStore, features_fingerprint
 from app.models import ModelValidationError, load_model, save_artifact, validate_artifact
 from app.process_manager import (
     STATE_DRAINING,
@@ -66,6 +75,9 @@ MAX_TIMEOUT_MS = 600_000
 SWAP_WAIT_SECONDS = float(os.environ.get("SWAP_WAIT_SECONDS", "3"))
 # How long shutdown waits for accepted inference to finish before killing workers.
 SHUTDOWN_GRACE_SECONDS = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "20"))
+# How long a completed /infer/once record is retained for retries.  In-progress
+# records are never expired.
+ONCE_RETENTION_SECONDS = float(os.environ.get("ONCE_RETENTION_SECONDS", "600"))
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +136,122 @@ class TimeoutResponse(BaseModel):
     detail: Dict[str, Any]
 
 
+class OnceInferRequest(BaseModel):
+    """A workpiece classification that may be retried by the device.
+
+    ``(device_id, workpiece_id)`` is the idempotency key.  The first accepted
+    call pins the active model version, the inference id and the features;
+    concurrent and later retries with the same features share that one
+    computation and replay its result or error.  Different features for the
+    same key are refused with 409 so a device cannot silently get one
+    workpiece's judgement for another's features.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "device_id": "line-3-station-7",
+                "workpiece_id": "WP-20261117-0001",
+                "features": [0.7, 0.2, 0.1, 0.5],
+                "timeout_ms": 200,
+                "slow_ms": 3000,
+            }
+        }
+    )
+
+    device_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Stable machine/station identifier; half of the idempotency key.",
+    )
+    workpiece_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description=(
+            "Workpiece identifier unique within the device for at least the "
+            "retention window; half of the idempotency key."
+        ),
+    )
+    features: List[float] = Field(..., description="Feature vector for the classifier")
+    timeout_ms: Optional[int] = Field(
+        None,
+        ge=1,
+        le=MAX_TIMEOUT_MS,
+        description=(
+            "How long *this caller* is willing to wait, in milliseconds. Each "
+            "retry has its own budget; on expiry the caller gets 504 while the "
+            "shared computation keeps running and the record stays in progress."
+        ),
+    )
+    timeout_seconds: Optional[float] = Field(
+        None,
+        gt=0,
+        le=MAX_TIMEOUT_MS / 1000.0,
+        description="Same as timeout_ms, in seconds. timeout_ms wins if both are set.",
+    )
+    slow_ms: int = Field(
+        0,
+        ge=0,
+        le=600_000,
+        description=(
+            "Demo hook: delay the shared computation. Only the call that first "
+            "creates the record passes this to the worker; retries reuse it."
+        ),
+    )
+
+    @field_validator("device_id", "workpiece_id")
+    @classmethod
+    def _ids_usable(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        if not all(0x20 <= ord(ch) < 0x7F for ch in stripped):
+            raise ValueError("must be printable ASCII")
+        return stripped
+
+    @field_validator("features")
+    @classmethod
+    def _features_present(cls, value: List[float]) -> List[float]:
+        if not value:
+            raise ValueError("features must contain at least one value")
+        # Note: NaN/inf are rejected by the route with a 422 whose body never
+        # echoes the value, because Starlette cannot serialise them.
+        return value
+
+
+class OnceInferResponse(BaseModel):
+    """Result of a workpiece classification; identical for every retry."""
+
+    version: str = Field(..., description="Model version pinned when the record was created.")
+    label: str
+    score: float
+    inference_id: str = Field(
+        ...,
+        description="Stable id of the one underlying computation; every retry returns it.",
+    )
+    device_id: str
+    workpiece_id: str
+    compute_ms: float = Field(
+        ..., description="Time the worker spent on the computation, shared by all callers."
+    )
+    elapsed_ms: float = Field(..., description="How long *this* caller waited.")
+    waited: bool = Field(
+        ...,
+        description="True if this caller joined an already-accepted or finished record.",
+    )
+    record_state: str = Field(
+        ...,
+        description="'computed' if this call's own computation finished; 'joined' if it "
+        "waited on an already-accepted in-progress computation; 'completed' if it "
+        "read an already-finished record.",
+    )
+    retained_until: float = Field(
+        ..., description="Epoch seconds after which the completed record may be evicted."
+    )
+
+
 class ModelUpload(BaseModel):
     version: str = Field(..., description="Unique version id, e.g. 'v3'")
     weights: List[List[float]] = Field(..., description="(n_classes x n_features) matrix")
@@ -174,6 +302,10 @@ class StatusView(BaseModel):
     capacity: int
     slots: List[SlotView]
     versions: List[Dict[str, Any]]
+    once_records: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Bookkeeping for /infer/once workpiece records (counts only).",
+    )
 
 
 class SwapResult(BaseModel):
@@ -205,6 +337,11 @@ class InferenceService:
         self._background: set[asyncio.Task] = set()
         self._swap_lock = asyncio.Lock()  # serialises swaps inside this process
         self._lock_file: Any = None
+        self.once = OnceStore(
+            retention_seconds=ONCE_RETENTION_SECONDS,
+            reap_interval=min(1.0, max(0.05, ONCE_RETENTION_SECONDS / 10.0)),
+        )
+        self._reap_task: Optional[asyncio.Task] = None
 
     # -- lifecycle -------------------------------------------------------
     async def startup(self) -> None:
@@ -230,6 +367,7 @@ class InferenceService:
             limits=httpx.Limits(max_connections=512, max_keepalive_connections=128),
         )
         self._drain_task = asyncio.create_task(self._drain_loop())
+        self._reap_task = asyncio.create_task(self._once_reap_loop())
         bootstrap_version = os.environ.get("BOOTSTRAP_VERSION")
         bootstrap_model = os.environ.get("BOOTSTRAP_MODEL")
         if bootstrap_version and bootstrap_model and Path(bootstrap_model).is_file():
@@ -251,6 +389,11 @@ class InferenceService:
 
     async def shutdown(self) -> None:
         self._closing = True
+        if self._reap_task is not None:
+            self._reap_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._reap_task
+            self._reap_task = None
         if self._drain_task is not None:
             self._drain_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -609,11 +752,18 @@ class InferenceService:
                 self.registry.release_slot(info["slot_id"], version, process_exited=True)
 
     # -- inference -------------------------------------------------------
-    async def infer(
-        self, features: List[float], timeout_ms: int, slow_ms: int = 0
-    ) -> InferResponse:
+    @staticmethod
+    def _resolve_timeout(timeout_ms: Optional[int], timeout_seconds: Optional[float]) -> int:
+        if timeout_ms is not None:
+            return timeout_ms
+        if timeout_seconds is not None:
+            return max(1, int(round(timeout_seconds * 1000)))
+        return DEFAULT_TIMEOUT_MS
+
+    def _admit(self, n_features: int) -> str:
+        """Pin the active version and count one in-flight call on its slot."""
         try:
-            version, _slot_id = self.registry.accept_work(len(features))
+            version, _slot_id = self.registry.accept_work(n_features)
         except FeatureMismatch as exc:
             raise HTTPException(
                 status_code=422,
@@ -622,7 +772,7 @@ class InferenceService:
                     "message": str(exc),
                     "version": exc.version,
                     "expected_features": exc.expected,
-                    "received_features": len(features),
+                    "received_features": n_features,
                 },
             ) from exc
         except NoActiveModel as exc:
@@ -630,7 +780,6 @@ class InferenceService:
                 status_code=503,
                 detail={"error": "no_active_model", "message": str(exc)},
             ) from exc
-
         handle = self.handles.get(version)
         if handle is None:  # pragma: no cover - registry/handle invariant
             self.registry.complete_work(version)
@@ -638,6 +787,13 @@ class InferenceService:
                 status_code=503,
                 detail={"error": "worker_missing", "message": f"worker for {version} is gone"},
             )
+        return version
+
+    async def infer(
+        self, features: List[float], timeout_ms: int, slow_ms: int = 0
+    ) -> InferResponse:
+        version = self._admit(len(features))
+        handle = self.handles[version]
 
         payload: Dict[str, Any] = {"features": features}
         if slow_ms:
@@ -700,6 +856,268 @@ class InferenceService:
             elapsed_ms=round(elapsed, 3),
         )
 
+    async def infer_once(
+        self,
+        device_id: str,
+        workpiece_id: str,
+        features: List[float],
+        timeout_ms: int,
+        slow_ms: int = 0,
+    ) -> OnceInferResponse:
+        """Idempotent inference keyed by ``(device_id, workpiece_id)``.
+
+        The admission decision -- look up the key, admit one in-flight call,
+        create the record, start the shielded worker task -- happens without
+        yielding to the event loop, so concurrent retries of a first-time
+        workpiece cannot both dispatch.  Each caller then waits on the *shared*
+        record task with its own timeout.  A 504 or disconnect only stops that
+        caller waiting; the record task, the worker computation and the
+        version's in-flight count are untouched.  The registry pins the version
+        at admission, so a later retry after a model swap still reports the
+        original version's judgement and id.
+        """
+        started = time.perf_counter()
+        fingerprint = features_fingerprint(features)
+        try:
+            record = self.once.lookup(device_id, workpiece_id, fingerprint)
+        except OnceConflict as exc:
+            existing = exc.record
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "features_conflict",
+                    "message": str(exc),
+                    "device_id": device_id,
+                    "workpiece_id": workpiece_id,
+                    "version": existing.version,
+                    "inference_id": existing.inference_id,
+                    "record_state": "in_progress" if not existing.finished else "completed",
+                },
+            ) from exc
+
+        if record is not None:
+            if record.finished:
+                return self._once_response(record, started, waited=True, state="completed")
+            return await self._await_once(
+                record, timeout_ms, started, waited=True, state="joined"
+            )
+
+        # First acceptance for this key: pin version + inference id now.  No
+        # ``await`` may occur between this admission and registering the record
+        # task, so a concurrent retry cannot observe a half-wired record.
+        version = self._admit(len(features))
+        try:
+            handle = self.handles[version]
+            inference_id = uuid.uuid4().hex
+            record = self.once.create(
+                device_id=device_id,
+                workpiece_id=workpiece_id,
+                fingerprint=fingerprint,
+                version=version,
+                inference_id=inference_id,
+            )
+            payload: Dict[str, Any] = {"features": features}
+            if slow_ms:
+                payload["slow_ms"] = slow_ms
+            # Tracked in _background so shutdown waits for/limits the
+            # computation, but never awaited by a caller directly: callers
+            # shield it.
+            record.task = asyncio.create_task(self._run_once(record, handle, payload))
+            self._background.add(record.task)
+            record.task.add_done_callback(self._background.discard)
+        except BaseException:
+            # Wiring failed before anything was dispatched: forget the record
+            # (it could never complete, so it would never expire) and give the
+            # slot's in-flight count back so the version can drain normally.
+            try:
+                self.once.discard(device_id, workpiece_id)
+            finally:
+                self.registry.complete_work(version)
+            raise
+        return await self._await_once(
+            record, timeout_ms, started, waited=False, state="computed"
+        )
+
+    async def _run_once(
+        self, record: OnceRecord, handle: WorkerHandle, payload: Dict[str, Any]
+    ) -> None:
+        """The one worker call behind a workpiece record; never cancelled by callers."""
+        version = record.version
+        started = time.perf_counter()
+        try:
+            assert self.client is not None
+            resp = await self.client.post(handle.inference_url(), json=payload)
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"worker {version} returned HTTP {resp.status_code}: {resp.text[:300]}"
+                )
+            body = resp.json()
+            record.label = str(body["label"])
+            record.score = float(body["score"])
+            record.compute_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            logger.info(
+                "workpiece %s/%s computed on %s as %s (inference %s)",
+                record.device_id,
+                record.workpiece_id,
+                version,
+                record.label,
+                record.inference_id,
+            )
+        except asyncio.CancelledError:
+            record.error_status = 503
+            record.error_detail = {
+                "error": "service_shutting_down",
+                "version": version,
+                "inference_id": record.inference_id,
+                "message": "the service stopped before this computation finished",
+            }
+            raise
+        except httpx.HTTPError as exc:
+            record.error_status = 502
+            record.error_detail = {
+                "error": "worker_unreachable",
+                "version": version,
+                "inference_id": record.inference_id,
+                "message": str(exc),
+            }
+            logger.warning(
+                "workpiece %s/%s failed on %s: %s",
+                record.device_id,
+                record.workpiece_id,
+                version,
+                exc,
+            )
+        except Exception as exc:
+            record.error_status = 502
+            record.error_detail = {
+                "error": "worker_error",
+                "version": version,
+                "inference_id": record.inference_id,
+                "message": str(exc),
+            }
+            logger.exception(
+                "workpiece %s/%s failed on %s", record.device_id, record.workpiece_id, version
+            )
+        finally:
+            record.completed_at = time.time()
+            # Releases the version's in-flight count exactly once, when the
+            # worker call actually settled -- never when a caller gave up.
+            self.registry.complete_work(version)
+
+    async def _await_once(
+        self,
+        record: OnceRecord,
+        timeout_ms: int,
+        started: float,
+        waited: bool,
+        state: str,
+    ) -> OnceInferResponse:
+        try:
+            # shield: this caller's timeout/cancellation must not touch the
+            # shared task, which owns the in-flight count and the result.
+            await asyncio.wait_for(asyncio.shield(record.task), timeout_ms / 1000.0)
+        except asyncio.TimeoutError:
+            # The computation may have settled in the same tick the wait
+            # expired; in that case replay it instead of a pointless 504.
+            if not record.finished:
+                elapsed = (time.perf_counter() - started) * 1000.0
+                logger.warning(
+                    "workpiece %s/%s caller stopped waiting after %dms "
+                    "(inference %s); computation continues",
+                    record.device_id,
+                    record.workpiece_id,
+                    timeout_ms,
+                    record.inference_id,
+                )
+                raise HTTPException(
+                    status_code=504,
+                    detail={
+                        "error": "inference_timeout",
+                        "version": record.version,
+                        "device_id": record.device_id,
+                        "workpiece_id": record.workpiece_id,
+                        "inference_id": record.inference_id,
+                        "timeout_ms": timeout_ms,
+                        "elapsed_ms": round(elapsed, 3),
+                        "record_state": "in_progress",
+                        "note": (
+                            "Retry the same device/workpiece with a longer timeout to "
+                            "retrieve this computation's result and inference id; it is "
+                            "not dispatched again."
+                        ),
+                    },
+                )
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                # This caller was cancelled (disconnect / framework cancel):
+                # propagate; the shared task keeps running.
+                raise
+            # The shared task itself was cancelled (shutdown).  Its error was
+            # recorded before it exited; fall through and replay it.
+            logger.info(
+                "workpiece %s/%s computation was cancelled; replaying stored outcome",
+                record.device_id,
+                record.workpiece_id,
+            )
+        if record.error_status is not None:
+            # Replay the same error for every retry; no second dispatch.
+            raise HTTPException(status_code=record.error_status, detail=record.error_detail)
+        return self._once_response(record, started, waited=waited, state=state)
+
+    def _once_response(
+        self,
+        record: OnceRecord,
+        started: float,
+        waited: bool,
+        state: str,
+    ) -> OnceInferResponse:
+        if record.error_status is not None:
+            raise HTTPException(status_code=record.error_status, detail=record.error_detail)
+        if record.label is None or record.score is None:
+            # Defensive: the record task settled without a result and without a
+            # classified error (e.g. an unhandled BaseException).  Never leak a
+            # 500 for a workpiece an earlier call already accepted.
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "worker_error",
+                    "version": record.version,
+                    "inference_id": record.inference_id,
+                    "message": "the computation ended without a result",
+                },
+            )
+        elapsed = (time.perf_counter() - started) * 1000.0
+        outcome = record.result_view()
+        return OnceInferResponse(
+            version=record.version,
+            device_id=record.device_id,
+            workpiece_id=record.workpiece_id,
+            inference_id=record.inference_id,
+            compute_ms=outcome["compute_ms"],
+            elapsed_ms=round(elapsed, 3),
+            waited=waited,
+            record_state=state,
+            retained_until=round(
+                (record.completed_at or time.time()) + self.once.retention_seconds, 3
+            ),
+            label=outcome["label"],
+            score=outcome["score"],
+        )
+
+    async def _once_reap_loop(self) -> None:
+        interval = max(0.05, min(5.0, self.once.reap_interval))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                dropped = self.once.reap(force=True)
+                if dropped:
+                    logger.debug("expired %d completed workpiece record(s)", dropped)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("workpiece record reaper error")
+
     async def _proxy_inference(
         self, version: str, handle: WorkerHandle, payload: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -754,6 +1172,7 @@ class InferenceService:
             versions=sorted(
                 snapshot["versions"].values(), key=lambda v: v.get("created_at", 0)
             ),
+            once_records=self.once.summary(),
         )
 
 
@@ -802,12 +1221,27 @@ app = FastAPI(
         "are pinned to the version active when accepted. `timeout_ms` (or "
         "`timeout_seconds`) bounds the *client wait only*: on expiry you get 504 "
         "while the worker keeps working and keeps its slot.\n"
+        "* `POST /infer/once` is the device-retry-safe variant. It keys one "
+        "computation on `(device_id, workpiece_id)`: the first accepted call pins "
+        "the version and an `inference_id`, concurrent and later retries with the "
+        "same `features` join/replay it, different features get 409, and a 504 or "
+        "disconnect only ends *that caller's* wait. Completed results/errors are "
+        "kept 10 minutes (`ONCE_RETENTION_SECONDS`); in-progress records never "
+        "expire. Retrying after a model swap still returns the original version's "
+        "judgement and id.\n"
         "* `GET /admin/status` shows the active version, in-flight counts and each "
         "process slot's state (`loading` / `active` / `draining` / `idle`).\n\n"
         "**Demos**\n"
         "- Slow inference: `POST /infer` with `slow_ms: 3000`, `timeout_ms: 200`, "
         "then watch `/admin/status` and try uploading another version: while the "
         "drained version still works, only one slot is free.\n"
+        "- Retry-safe workpiece: `POST /infer/once` with `slow_ms: 3000`, "
+        "`timeout_ms: 200` -> 504 with an `inference_id`; repeat the identical body "
+        "with `timeout_ms: 10000` -> the same `inference_id`, label and score, "
+        "`waited: true`. Change one feature -> 409 `features_conflict`.\n"
+        "- Swap then retry: after the first `/infer/once` was accepted, upload a new "
+        "version. Retrying the same workpiece still reports the original `version` "
+        "and result.\n"
         "- Load failure: upload with `simulate_load_failure: true` (or malformed "
         "weights). You get 502 and the old version remains active.\n"
         "- Capacity: trigger a slow in-flight request, swap once, then try a third "
@@ -838,13 +1272,56 @@ def healthz() -> Dict[str, Any]:
     summary="Classify a feature vector",
 )
 async def infer(req: InferRequest) -> InferResponse:
-    if req.timeout_ms is not None:
-        timeout_ms = req.timeout_ms
-    elif req.timeout_seconds is not None:
-        timeout_ms = max(1, int(round(req.timeout_seconds * 1000)))
-    else:
-        timeout_ms = DEFAULT_TIMEOUT_MS
+    timeout_ms = InferenceService._resolve_timeout(req.timeout_ms, req.timeout_seconds)
     return await service.infer(req.features, timeout_ms, req.slow_ms)
+
+
+@app.post(
+    "/infer/once",
+    response_model=OnceInferResponse,
+    responses={
+        409: {
+            "description": (
+                "The same device/workpiece was already accepted with different "
+                "features; this call is not dispatched."
+            )
+        },
+        504: {
+            "model": TimeoutResponse,
+            "description": (
+                "This caller's wait expired. The shared computation keeps running "
+                "and stays in progress; retry to retrieve its result/inference id."
+            ),
+        },
+        502: {"description": "The underlying worker call failed (error is replayed on retry)."},
+        503: {"description": "No active model"},
+    },
+    tags=["inference"],
+    summary="Classify a workpiece once; retries share one computation and result",
+)
+async def infer_once(req: OnceInferRequest) -> OnceInferResponse:
+    # NaN/inf reach here (the JSON parser accepts them) but must never be
+    # fingerprinted, dispatched or echoed in a validation body -- Starlette
+    # cannot serialise them. Reject with a plain 422.
+    finite = all(
+        isinstance(value, (int, float))
+        and value == value
+        and abs(value) != float("inf")
+        for value in req.features
+    )
+    if not finite:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_features", "message": "features must be finite numbers"},
+        )
+    timeout_ms = InferenceService._resolve_timeout(req.timeout_ms, req.timeout_seconds)
+    return await service.infer_once(
+        device_id=req.device_id,
+        workpiece_id=req.workpiece_id,
+        features=req.features,
+        timeout_ms=timeout_ms,
+        slow_ms=req.slow_ms,
+    )
 
 
 @app.post(

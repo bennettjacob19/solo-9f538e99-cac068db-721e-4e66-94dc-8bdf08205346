@@ -7,6 +7,7 @@ running a third model process.
 
 ```
 POST /infer           classify a feature vector (with optional client timeout)
+POST /infer/once      idempotent per-workpiece classification for device retries
 POST /admin/models    upload weights/bias/labels and hot-swap the model in
 GET  /admin/versions  version registry
 GET  /admin/status    active version, in-flight counts, per-process state
@@ -20,6 +21,7 @@ GET  /docs            Swagger UI (interactive; shows every field)
 docker compose up --build
 # API + Swagger UI:  http://localhost:8000/docs
 # quick demo:        python examples/demo.py http://localhost:8000
+# retry demo:        python examples/demo_once.py http://localhost:8000
 ```
 
 Or without Docker:
@@ -65,6 +67,64 @@ else is rejected with 422 before a process is started.
 | `expected_active_version` | optimistic guard; 409 if the active version changed |
 | `slow_load_ms` | demo: delay worker readiness to watch the old version serve |
 | `simulate_load_failure` | demo: make the new worker report a load failure |
+
+## `POST /infer/once` — device retries without duplicate computation
+
+A flaky production-line network makes the device resend the same workpiece.
+`/infer/once` treats `(device_id, workpiece_id)` as an idempotency key.
+
+```json
+POST /infer/once
+{
+  "device_id": "line-3-station-7",
+  "workpiece_id": "WP-20261117-0001",
+  "features": [0.7, 0.2, 0.1, 0.5],
+  "slow_ms": 3000,
+  "timeout_ms": 150
+}
+```
+
+* **First acceptance pins everything.** In one non-yielding step the API reads
+  the active version, increments that version's in-flight counter (`accept_work`),
+  creates the record and starts the shielded worker task. The record holds the
+  version, an `inference_id` and a fingerprint of the features. Concurrent
+  first attempts serialise on the event loop, so exactly one dispatches; the
+  others find the record and wait on the same task.
+* **Same key + same features = the same computation.** A retry while it is
+  in progress waits on the shared task (`record_state: "joined"`); a retry
+  after it finished reads the stored result (`record_state: "completed"`).
+  Both return the same `inference_id`, `version`, `label` and `score`, and
+  never start a second worker call.
+* **Same key + different features = 409 `features_conflict`.** No dispatch
+  happens; the response names the original `inference_id` and its state.
+  Feature comparison is a SHA-256 of the canonical JSON floats (`-0.0`
+  normalises to `0.0`), so repeated identical vectors always match.
+* **Each caller has its own wait budget.** `timeout_ms` / `timeout_seconds`
+  bound only *that* caller. On expiry it gets 504 with the `inference_id` and
+  `record_state: "in_progress"`; the task, the worker computation and the
+  version's in-flight count are untouched. A client that disconnects behaves
+  the same way: the shared task is never cancelled and the slot is held until
+  the worker really returns.
+* **A swap does not change an accepted workpiece.** Because the version was
+  pinned at admission, a retry after `/admin/models` promoted a new version
+  still returns the *original* version's label/score, while new traffic and
+  `/infer` use the new version.
+* **Failures are replayed, not retried.** If the worker call fails, the error
+  status and body (including the `inference_id`) are stored and returned
+  verbatim on every retry until retention expires; the worker is not called
+  again.
+* **Retention.** Completed records (success *or* failure) are kept
+  `ONCE_RETENTION_SECONDS` (default 600 s) after completion, then reaped.
+  In-progress records never expire. Once a completed record is gone the key is
+  free, so a late resend is treated as fresh work with a new `inference_id`.
+  Records are in-memory: an API restart forgets them (the registry/version
+  guarantees are unaffected).
+* `/admin/status` includes `once_records` counts (`in_progress`, `completed`,
+  `failed`, `retention_seconds`), never feature values.
+
+The response also carries `waited`, `record_state` (`computed` / `joined` /
+`completed`), `compute_ms` (time inside the worker, shared by all callers),
+`elapsed_ms` (this caller's wait) and `retained_until`.
 
 ## The guarantees and how they are enforced
 
@@ -129,8 +189,16 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
    becomes active and the slow version goes `draining`. A third upload returns
    429 while the slow computation still runs. After it finishes the slot is
    released and the upload succeeds.
+4. **Retry-safe workpiece.** `POST /infer/once` with `slow_ms: 3000`,
+   `timeout_ms: 150` → 504 carrying an `inference_id`. Resend the identical
+   body with `timeout_ms: 10000` before the work ends → 200 with the same
+   `inference_id`, label and score (`waited: true`, `record_state: "joined"`).
+   Send different features for the same key → 409 `features_conflict`. Upload
+   a new version between a slow acceptance and its retry → the retry still
+   reports the original version's judgement; `/infer` already uses the new one.
 
-`python examples/demo.py <base-url>` runs all three end to end.
+`python examples/demo.py <base-url>` runs scenarios 1–3 end to end;
+`python examples/demo_once.py <base-url>` runs scenario 4.
 
 ## Observations from the smoke runs
 
@@ -140,22 +208,39 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
   (verified: 429 until the slow request finished, then `idle`).
 - SIGTERM with an in-flight request: the request completed with 200, the API
   exited 0/-15 cleanly, and no worker processes remained.
+- `/infer/once`, six concurrent identical requests for a new key (`slow_ms`
+  1200): `total_accepted` grew by exactly 1, all six returned one
+  `inference_id`, and exactly one had `waited: false`.
+- Slow workpiece (3 s) with `timeout_ms: 150`: 504 carried the
+  `inference_id`; `/admin/status` then showed `in_flight: 1` and
+  `once_records.in_progress: 1`. The retry returned the same id, label and
+  score, with `compute_ms` ≈ 3000 and `waited: true`. Swapping versions while
+  it ran did not change the retry's `version`.
+- Closing the TCP connection before the response: `in_flight` stayed at 1
+  until the worker finished, and the retry replayed the shared result.
+- SIGKILL of the worker mid-`/infer/once`: the caller got 502 with an
+  `inference_id`; the retry returned the same error detail and did not
+  increment `total_accepted` or spawn a worker.
 
 ## Layout
 
 ```
 app/
-  main.py             API, swap orchestration, drain loop, status
+  main.py             API, swap orchestration, drain loop, status, /infer/once
   process_manager.py  shared registry/state machine + worker process handles
-  worker.py           per-versionHTTP server (one process per version)
+  idempotency.py      /infer/once record store, feature fingerprints, retention
+  worker.py           per-version HTTP server (one process per version)
   worker_launcher.py  process entry point: load artifact, bind, serve, handshake
   models.py           artifact validation, NumPy scoring
 tests/
   test_models.py          artifact validation + scoring
   test_registry.py        state machine, claims, drain gate, crash reclaim
-  test_api_integration.py real API + real worker processes
+  test_idempotency.py     once-store keys, conflicts, retention, summaries
+  test_api_integration.py real API + real worker processes (swap/timeout/drain)
+  test_once_integration.py real API + workers (once/retry/swap/disconnect/failure)
+  test_once_caller.py     caller cancellation/shutdown semantics of the shared task
 examples/
-  demo.py, models/*.json
+  demo.py, demo_once.py, models/*.json
 ```
 
 ## Configuration
@@ -164,6 +249,7 @@ examples/
 | --- | --- | --- |
 | `DATA_DIR` | `/data` | models, staging, worker control dirs, instance lock |
 | `DEFAULT_INFER_TIMEOUT_MS` | `5000` | client wait when `timeout_ms` is omitted |
+| `ONCE_RETENTION_SECONDS` | `600` | how long a completed `/infer/once` record serves retries (in-progress records never expire) |
 | `SWAP_WAIT_SECONDS` | `3` | how long an upload waits for a draining slot before 429 |
 | `SHUTDOWN_GRACE_SECONDS` | `20` | how long shutdown waits for in-flight work |
 | `BOOTSTRAP_VERSION` / `BOOTSTRAP_MODEL` | unset | optionally load one artifact at startup |
